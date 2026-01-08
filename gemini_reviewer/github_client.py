@@ -210,54 +210,199 @@ class GitHubClient:
             logger.error(f"Unexpected error while fetching diff: {str(e)}")
             raise GitHubClientError(f"Failed to fetch diff: {str(e)}")
     
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((requests.exceptions.RequestException, Exception))
-    )
+    # Maximum comments per review to avoid API limits
+    MAX_COMMENTS_PER_BATCH = 50
+    BATCH_DELAY_SECONDS = 2  # Delay between batches to avoid rate limiting
+
     def create_review(self, pr_details: PRDetails, comments: List[ReviewComment]) -> bool:
-        """Create a review with comments on GitHub with retry logic."""
+        """Create a review with comments on GitHub, batching if necessary."""
         if not comments:
             logger.warning("No comments provided for review creation")
             return False
-        
+
         logger.info(f"Creating review with {len(comments)} comments for PR #{pr_details.pull_number}")
-        
+
         try:
             repo_obj = self._get_repo_with_retry(pr_details.repo_full_name)
             pr = self._get_pr_with_retry(repo_obj, pr_details.pull_number)
-            
+
             # Validate and convert comments
             github_comments = []
             for comment in comments:
                 if not isinstance(comment, ReviewComment):
                     logger.warning(f"Invalid comment type: {type(comment)}")
                     continue
-                
+
                 github_comment = self._validate_and_sanitize_comment(comment)
                 if github_comment:
                     github_comments.append(github_comment)
-            
+
             if not github_comments:
                 logger.warning("No valid comments found after validation")
                 return False
-            
-            logger.info(f"Creating review with {len(github_comments)} valid comments")
-            
-            # Create the review
+
+            # Batch comments if exceeding limit
+            if len(github_comments) > self.MAX_COMMENTS_PER_BATCH:
+                logger.info(f"Batching {len(github_comments)} comments into groups of {self.MAX_COMMENTS_PER_BATCH}")
+                return self._create_batched_reviews(pr, pr_details, comments, github_comments)
+
+            # Single review for small comment counts
+            return self._create_single_review(pr, comments, github_comments)
+
+        except Exception as e:
+            self._log_api_error(e, "create review")
+            raise GitHubClientError(f"Failed to create review: {str(e)}")
+
+    def _create_single_review(self, pr, comments: List[ReviewComment], github_comments: List[Dict[str, Any]]) -> bool:
+        """Create a single review with all comments."""
+        logger.info(f"Creating single review with {len(github_comments)} comments")
+
+        try:
             review_body = self._generate_review_summary(comments)
             review = pr.create_review(
                 body=review_body,
                 comments=github_comments,
                 event="COMMENT"
             )
-            
             logger.info(f"✅ Review created successfully with ID: {review.id}")
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to create review: {str(e)}")
-            raise GitHubClientError(f"Failed to create review: {str(e)}")
+            self._log_api_error(e, "create single review")
+            raise
+
+    def _create_batched_reviews(
+        self,
+        pr,
+        pr_details: PRDetails,
+        all_comments: List[ReviewComment],
+        github_comments: List[Dict[str, Any]]
+    ) -> bool:
+        """Create multiple reviews in batches to avoid API limits."""
+        import time
+
+        total_batches = (len(github_comments) + self.MAX_COMMENTS_PER_BATCH - 1) // self.MAX_COMMENTS_PER_BATCH
+        successful_batches = 0
+        failed_batches = 0
+
+        for batch_num in range(total_batches):
+            start_idx = batch_num * self.MAX_COMMENTS_PER_BATCH
+            end_idx = min(start_idx + self.MAX_COMMENTS_PER_BATCH, len(github_comments))
+            batch_comments = github_comments[start_idx:end_idx]
+
+            logger.info(f"Processing batch {batch_num + 1}/{total_batches} ({len(batch_comments)} comments)")
+
+            # Check rate limit before each batch
+            self._check_and_wait_for_rate_limit()
+
+            try:
+                if batch_num == 0:
+                    # First batch includes the summary
+                    review_body = self._generate_review_summary(all_comments)
+                else:
+                    review_body = f"🤖 **Gemini AI Code Review** (continued, batch {batch_num + 1}/{total_batches})"
+
+                review = pr.create_review(
+                    body=review_body,
+                    comments=batch_comments,
+                    event="COMMENT"
+                )
+                logger.info(f"✅ Batch {batch_num + 1} created successfully with ID: {review.id}")
+                successful_batches += 1
+
+                # Add delay between batches to avoid rate limiting
+                if batch_num < total_batches - 1:
+                    logger.debug(f"Waiting {self.BATCH_DELAY_SECONDS}s before next batch...")
+                    time.sleep(self.BATCH_DELAY_SECONDS)
+
+            except Exception as e:
+                self._log_api_error(e, f"create batch {batch_num + 1}")
+                failed_batches += 1
+
+                # If rate limited, wait and retry this batch once
+                if self._is_rate_limit_error(e):
+                    logger.warning("Rate limit detected, waiting before retry...")
+                    self._wait_for_rate_limit_reset()
+                    try:
+                        review = pr.create_review(
+                            body=review_body,
+                            comments=batch_comments,
+                            event="COMMENT"
+                        )
+                        logger.info(f"✅ Batch {batch_num + 1} retry succeeded")
+                        successful_batches += 1
+                        failed_batches -= 1
+                    except Exception as retry_e:
+                        self._log_api_error(retry_e, f"retry batch {batch_num + 1}")
+                        # Continue with remaining batches
+                        continue
+
+        logger.info(f"Batched review complete: {successful_batches}/{total_batches} batches succeeded")
+        return failed_batches == 0
+
+    def _check_and_wait_for_rate_limit(self):
+        """Check rate limit and wait if necessary."""
+        try:
+            rate_info = self.check_rate_limit()
+            remaining = rate_info.get('core', {}).get('remaining', 'unknown')
+
+            if isinstance(remaining, int) and remaining < 10:
+                reset_time = rate_info.get('core', {}).get('reset')
+                logger.warning(f"Rate limit low ({remaining} remaining), waiting...")
+                self._wait_for_rate_limit_reset(reset_time)
+        except Exception as e:
+            logger.debug(f"Could not check rate limit: {e}")
+
+    def _wait_for_rate_limit_reset(self, reset_timestamp: float = None):
+        """Wait for rate limit to reset."""
+        import time
+
+        if reset_timestamp:
+            wait_time = max(0, reset_timestamp - time.time()) + 5  # Add 5s buffer
+            wait_time = min(wait_time, 300)  # Cap at 5 minutes
+        else:
+            wait_time = 60  # Default wait time
+
+        logger.info(f"Waiting {wait_time:.0f}s for rate limit reset...")
+        time.sleep(wait_time)
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Check if an error is due to rate limiting."""
+        error_str = str(error).lower()
+        return any(indicator in error_str for indicator in [
+            'rate limit', 'rate_limit', '403', 'forbidden',
+            'abuse detection', 'secondary rate limit'
+        ])
+
+    def _log_api_error(self, error: Exception, context: str):
+        """Log API error with detailed information."""
+        error_str = str(error)
+        logger.error(f"GitHub API error during {context}: {error_str}")
+
+        # Try to extract more details
+        if hasattr(error, 'response'):
+            response = error.response
+            if response is not None:
+                logger.error(f"  HTTP Status: {response.status_code}")
+
+                # Log rate limit headers if present
+                rate_headers = {
+                    'X-RateLimit-Limit': response.headers.get('X-RateLimit-Limit'),
+                    'X-RateLimit-Remaining': response.headers.get('X-RateLimit-Remaining'),
+                    'X-RateLimit-Reset': response.headers.get('X-RateLimit-Reset'),
+                }
+                if any(rate_headers.values()):
+                    logger.error(f"  Rate limit info: {rate_headers}")
+
+                # Log response body if available
+                try:
+                    body = response.text[:500] if response.text else None
+                    if body:
+                        logger.error(f"  Response body: {body}")
+                except Exception:
+                    pass
+
+        if self._is_rate_limit_error(error):
+            logger.error("  ⚠️ This appears to be a rate limit error")
     
     def _validate_and_sanitize_comment(self, comment: ReviewComment) -> Optional[Dict[str, Any]]:
         """Validate and sanitize a review comment."""

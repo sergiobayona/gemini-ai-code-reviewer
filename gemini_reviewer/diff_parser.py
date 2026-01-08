@@ -121,12 +121,13 @@ class DiffParser:
                 return None
             
             # Create FileInfo
+            # Note: unidiff uses is_rename, not is_renamed_file
             file_info = FileInfo(
                 path=file_path,
                 old_path=old_path if old_path != file_path else None,
                 is_new_file=patched_file.is_added_file,
                 is_deleted_file=patched_file.is_removed_file,
-                is_renamed_file=patched_file.is_renamed_file
+                is_renamed_file=getattr(patched_file, 'is_rename', False)
             )
             
             # Skip binary files
