@@ -254,7 +254,7 @@ class GitHubClient:
             raise GitHubClientError(f"Failed to create review: {str(e)}")
 
     def _create_single_review(self, pr, comments: List[ReviewComment], github_comments: List[Dict[str, Any]]) -> bool:
-        """Create a single review with all comments."""
+        """Create a single review with all comments, with fallback for position errors."""
         logger.info(f"Creating single review with {len(github_comments)} comments")
 
         try:
@@ -267,8 +267,63 @@ class GitHubClient:
             logger.info(f"✅ Review created successfully with ID: {review.id}")
             return True
         except Exception as e:
+            if self._is_position_error(e):
+                logger.warning("Position error detected, falling back to individual comment submission")
+                return self._create_review_with_fallback(pr, comments, github_comments)
             self._log_api_error(e, "create single review")
             raise
+
+    def _is_position_error(self, error: Exception) -> bool:
+        """Check if an error is a GitHub 422 position error."""
+        error_str = str(error).lower()
+        return "422" in error_str or "position" in error_str or "unprocessable" in error_str
+
+    def _create_review_with_fallback(
+        self, pr, comments: List[ReviewComment], github_comments: List[Dict[str, Any]]
+    ) -> bool:
+        """Try submitting comments individually; fall back to PR-level comments for failures."""
+        successful = 0
+        fallback = 0
+
+        review_body = self._generate_review_summary(comments)
+
+        for github_comment in github_comments:
+            try:
+                pr.create_review(
+                    body="",
+                    comments=[github_comment],
+                    event="COMMENT"
+                )
+                successful += 1
+            except Exception as individual_err:
+                logger.warning(
+                    f"Inline comment failed for {github_comment.get('path')} "
+                    f"pos {github_comment.get('position')}: {individual_err}"
+                )
+                # Fall back to a regular PR comment (not inline)
+                try:
+                    body = (
+                        f"**{github_comment.get('path')}** "
+                        f"(line {github_comment.get('position')})\n\n"
+                        f"{github_comment.get('body', '')}"
+                    )
+                    pr.create_issue_comment(body)
+                    fallback += 1
+                except Exception as fallback_err:
+                    logger.error(f"Fallback PR comment also failed: {fallback_err}")
+
+        # Post the review summary as a separate comment if any comments were posted
+        if successful > 0 or fallback > 0:
+            try:
+                pr.create_issue_comment(review_body)
+            except Exception:
+                pass
+
+        logger.info(
+            f"Fallback review complete: {successful} inline, {fallback} as PR comments, "
+            f"{len(github_comments) - successful - fallback} failed"
+        )
+        return (successful + fallback) > 0
 
     def _create_batched_reviews(
         self,
@@ -318,8 +373,14 @@ class GitHubClient:
                 self._log_api_error(e, f"create batch {batch_num + 1}")
                 failed_batches += 1
 
-                # If rate limited, wait and retry this batch once
-                if self._is_rate_limit_error(e):
+                if self._is_position_error(e):
+                    # Fall back to individual comment submission for this batch
+                    logger.warning(f"Position error in batch {batch_num + 1}, falling back to individual comments")
+                    batch_review_comments = all_comments[start_idx:end_idx] if start_idx < len(all_comments) else []
+                    if self._create_review_with_fallback(pr, batch_review_comments, batch_comments):
+                        successful_batches += 1
+                        failed_batches -= 1
+                elif self._is_rate_limit_error(e):
                     logger.warning("Rate limit detected, waiting before retry...")
                     self._wait_for_rate_limit_reset()
                     try:

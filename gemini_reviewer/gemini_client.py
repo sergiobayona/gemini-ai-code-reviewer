@@ -109,14 +109,34 @@ class GeminiClient:
     def _generate_content_with_validation(self, prompt: str) -> str:
         """Generate content with validation and error handling."""
         logger.info("Sending request to Gemini API...")
-        
+
         try:
             response = self._model.generate_content(prompt, generation_config=self._generation_config)
-            
-            if not response or not hasattr(response, 'text'):
-                raise GeminiClientError("Empty or invalid response from Gemini API")
-            
-            response_text = response.text.strip()
+
+            if not response:
+                raise GeminiClientError("Empty response from Gemini API")
+
+            # response.text is a property that raises ValueError when the
+            # response contains no valid Part (e.g. the model returned nothing
+            # or the request was blocked by safety filters).
+            try:
+                response_text = response.text
+            except (ValueError, AttributeError) as e:
+                # Check for safety/block feedback
+                block_reason = getattr(
+                    getattr(response, 'prompt_feedback', None),
+                    'block_reason', None
+                )
+                if block_reason:
+                    logger.warning(f"Response blocked by safety filter: {block_reason}")
+                    raise GeminiClientError(
+                        f"Response blocked by safety filter: {block_reason}"
+                    )
+                raise GeminiClientError(
+                    f"Invalid response from Gemini API (no valid Part): {e}"
+                )
+
+            response_text = response_text.strip()
             if not response_text:
                 raise GeminiClientError("Empty response text from Gemini API")
             
